@@ -1,42 +1,62 @@
+import 'dotenv/config';
 import { NativeConnection, Worker } from '@temporalio/worker';
-import * as activities from './activities';
+import { loadConfig } from './shared/config';
+import * as scanActivities from './domains/media/activities/scan';
+import * as subtitleActivities from './domains/media/activities/subtitles';
+import * as metadataActivities from './domains/media/activities/metadata';
+import * as llmActivities from './domains/media/activities/llm';
+import * as filesystemActivities from './domains/media/activities/filesystem';
 
 async function run() {
-  // Step 1: Establish a connection with Temporal server.
-  //
-  // Worker code uses `@temporalio/worker.NativeConnection`.
-  // (But in your application code it's `@temporalio/client.Connection`.)
+  const config = loadConfig();
+
+  // Connect to Temporal Server
   const connection = await NativeConnection.connect({
-    address: 'localhost:7233',
-    // TLS and gRPC metadata configuration goes here.
+    address: config.temporalAddress,
   });
+
   try {
-    // Step 2: Register Workflows and Activities with the Worker.
+    // Create the worker with all domain activities
     const worker = await Worker.create({
       connection,
-      namespace: 'default',
-      taskQueue: 'hello-world',
-      // Workflows are registered using a path as they run in a separate JS context.
+      namespace: config.temporalNamespace,
+      taskQueue: config.taskQueue,
+
+      // Workflows are bundled separately (V8 isolate)
       workflowsPath: require.resolve('./workflows'),
-      activities,
+
+      // Register all domain activities
+      activities: {
+        ...scanActivities,
+        ...subtitleActivities,
+        ...metadataActivities,
+        ...llmActivities,
+        ...filesystemActivities,
+      },
+
+      // Concurrency limits
+      maxConcurrentActivityTaskExecutions: config.maxConcurrentActivities,
+      maxConcurrentWorkflowTaskExecutions: config.maxConcurrentWorkflowTasks,
+
+      // Required by @temporalio/worker >=1.13 when workflow caching is enabled
+      workflowTaskPollerBehavior: { type: 'simple-maximum', maximum: 2 },
     });
 
-    // Step 3: Start accepting tasks on the `hello-world` queue
-    //
-    // The worker runs until it encounters an unexpected error or the process receives a shutdown signal registered on
-    // the SDK Runtime object.
-    //
-    // By default, worker logs are written via the Runtime logger to STDERR at INFO level.
-    //
-    // See https://typescript.temporal.io/api/classes/worker.Runtime#install to customize these defaults.
+    console.log(
+      `seraex worker started on task queue: ${config.taskQueue}`,
+    );
+    console.log(
+      `media roots input=${config.mediaInputRoot} staging=${config.mediaStagingRoot} output=${config.mediaOutputRoot}`,
+    );
+
+    // Run the worker until shutdown signal
     await worker.run();
   } finally {
-    // Close the connection once the worker has stopped
     await connection.close();
   }
 }
 
 run().catch((err) => {
-  console.error(err);
+  console.error('Worker failed:', err);
   process.exit(1);
 });
