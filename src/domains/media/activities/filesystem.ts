@@ -1,5 +1,6 @@
 import { rename, mkdir, access, readdir, stat, cp, rm } from 'fs/promises';
 import { join, dirname, extname, basename, relative } from 'path';
+import { Context } from '@temporalio/activity';
 import type {
   EpisodeMatch,
   AnimeSearchResult,
@@ -85,11 +86,29 @@ export async function copyToProcessing(
     return processingSeriesDir;
   }
   await mkdir(dirname(processingSeriesDir), { recursive: true });
-  await cp(sourceSeriesDir, processingSeriesDir, { recursive: true });
+  await withHeartbeat(() =>
+    cp(sourceSeriesDir, processingSeriesDir, { recursive: true }),
+  );
   console.log(
     `Copied series to processing: ${sourceSeriesDir} -> ${processingSeriesDir}`,
   );
   return processingSeriesDir;
+}
+
+/**
+ * Run an async operation while sending Temporal heartbeats on a timer.
+ * Keeps the activity alive even when a single I/O operation (e.g. copying
+ * a multi-GB file over NFS) takes longer than the heartbeat timeout.
+ */
+async function withHeartbeat<T>(fn: () => Promise<T>): Promise<T> {
+  const ctx = Context.current();
+  const interval = setInterval(() => ctx.heartbeat(), 30_000);
+  ctx.heartbeat();
+  try {
+    return await fn();
+  } finally {
+    clearInterval(interval);
+  }
 }
 
 /** Video file extensions */
@@ -134,40 +153,42 @@ export async function structureToStaging(
 
   const allFiles = await listAllFilesRecursive(processingSeriesDir);
 
-  for (const filePath of allFiles) {
-    const rel = relative(processingSeriesDir, filePath);
-    const ext = extname(filePath).toLowerCase();
+  await withHeartbeat(async () => {
+    for (const filePath of allFiles) {
+      const rel = relative(processingSeriesDir, filePath);
+      const ext = extname(filePath).toLowerCase();
 
-    if (renamedSet.has(filePath)) {
-      // Episode: extract season from renamed filename (S01E01 pattern)
-      const seasonMatch = basename(filePath).match(/- S(\d{2})E\d{2}/);
-      const seasonDir = seasonMatch
-        ? `Season ${seasonMatch[1]}`
-        : 'Season 01';
-      const destPath = join(stagingShowDir, seasonDir, basename(filePath));
+      if (renamedSet.has(filePath)) {
+        // Episode: extract season from renamed filename (S01E01 pattern)
+        const seasonMatch = basename(filePath).match(/- S(\d{2})E\d{2}/);
+        const seasonDir = seasonMatch
+          ? `Season ${seasonMatch[1]}`
+          : 'Season 01';
+        const destPath = join(stagingShowDir, seasonDir, basename(filePath));
 
-      if (!dryRun) {
-        await mkdir(dirname(destPath), { recursive: true });
-        await cp(filePath, destPath);
-        console.log(`Episode -> ${destPath}`);
-      } else {
-        console.log(`[DRY RUN] Episode -> ${destPath}`);
+        if (!dryRun) {
+          await mkdir(dirname(destPath), { recursive: true });
+          await cp(filePath, destPath);
+          console.log(`Episode -> ${destPath}`);
+        } else {
+          console.log(`[DRY RUN] Episode -> ${destPath}`);
+        }
+      } else if (VIDEO_EXTENSIONS.has(ext)) {
+        // Non-episode video: Extras preserving relative path
+        const destPath = join(stagingShowDir, 'Extras', rel);
+        extraFiles.push(rel);
+
+        if (!dryRun) {
+          await mkdir(dirname(destPath), { recursive: true });
+          await cp(filePath, destPath);
+          console.log(`Extra -> ${destPath}`);
+        } else {
+          console.log(`[DRY RUN] Extra -> ${destPath}`);
+        }
       }
-    } else if (VIDEO_EXTENSIONS.has(ext)) {
-      // Non-episode video: Extras preserving relative path
-      const destPath = join(stagingShowDir, 'Extras', rel);
-      extraFiles.push(rel);
-
-      if (!dryRun) {
-        await mkdir(dirname(destPath), { recursive: true });
-        await cp(filePath, destPath);
-        console.log(`Extra -> ${destPath}`);
-      } else {
-        console.log(`[DRY RUN] Extra -> ${destPath}`);
-      }
+      // Non-video files are silently skipped
     }
-    // Non-video files are silently skipped
-  }
+  });
 
   return { stagingShowDir, extraFiles };
 }
@@ -194,18 +215,20 @@ export async function mergeToOutput(
 
   const allFiles = await listAllFilesRecursive(stagingShowDir);
 
-  for (const filePath of allFiles) {
-    const rel = relative(stagingShowDir, filePath);
-    const destPath = join(outputDir, rel);
+  await withHeartbeat(async () => {
+    for (const filePath of allFiles) {
+      const rel = relative(stagingShowDir, filePath);
+      const destPath = join(outputDir, rel);
 
-    if (!dryRun) {
-      await mkdir(dirname(destPath), { recursive: true });
-      await cp(filePath, destPath);
-      console.log(`Output -> ${destPath}`);
-    } else {
-      console.log(`[DRY RUN] Output -> ${destPath}`);
+      if (!dryRun) {
+        await mkdir(dirname(destPath), { recursive: true });
+        await cp(filePath, destPath);
+        console.log(`Output -> ${destPath}`);
+      } else {
+        console.log(`[DRY RUN] Output -> ${destPath}`);
+      }
     }
-  }
+  });
 
   return { outputDir };
 }
@@ -223,7 +246,9 @@ export async function cleanupProcessing(
     );
     return;
   }
-  await rm(processingWorkflowDir, { recursive: true, force: true });
+  await withHeartbeat(() =>
+    rm(processingWorkflowDir, { recursive: true, force: true }),
+  );
   console.log(`Cleaned up processing: ${processingWorkflowDir}`);
 }
 
@@ -240,7 +265,9 @@ export async function cleanupStaging(
     );
     return;
   }
-  await rm(stagingWorkflowDir, { recursive: true, force: true });
+  await withHeartbeat(() =>
+    rm(stagingWorkflowDir, { recursive: true, force: true }),
+  );
   console.log(`Cleaned up staging: ${stagingWorkflowDir}`);
 }
 
@@ -251,7 +278,7 @@ export async function cleanupStaging(
 export async function listStagingTree(
   rootDir: string,
 ): Promise<FileTreeNode[]> {
-  return buildTree(rootDir, rootDir);
+  return withHeartbeat(() => buildTree(rootDir, rootDir));
 }
 
 async function buildTree(
