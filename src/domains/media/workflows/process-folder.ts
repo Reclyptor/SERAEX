@@ -6,15 +6,11 @@ import {
   condition,
 } from '@temporalio/workflow';
 
-import type * as scanActivities from '../activities/scan';
 import type * as subtitleActivities from '../activities/subtitles';
-import type * as metadataActivities from '../activities/metadata';
 import type * as llmActivities from '../activities/llm';
 import type * as filesystemActivities from '../activities/filesystem';
 
-type Activities = typeof scanActivities &
-  typeof subtitleActivities &
-  typeof metadataActivities &
+type Activities = typeof subtitleActivities &
   typeof llmActivities &
   typeof filesystemActivities;
 
@@ -24,47 +20,54 @@ import type {
   ProcessFolderProgress,
   ReviewItem,
   ReviewDecision,
+  DetectionConfirmation,
   RenamedFile,
   EpisodeMatch,
   FolderStatus,
+  SourceFileInfo,
+  ExtractedSubtitles,
 } from '../../../shared/types';
 
-// Proxy all media activities with appropriate timeouts
-const {
-  listFilesRecursive,
-  filterByDuration,
-  extractSubtitles,
-  matchEpisodes,
-  renameFile,
-} = proxyActivities<Activities>({
+// ── Activity proxies ─────────────────────────────────────────────────
+
+const { detectEpisodeFiles, extractSubtitleToDir } =
+  proxyActivities<Activities>({
+    startToCloseTimeout: '10 minutes',
+    retry: { maximumAttempts: 3, initialInterval: '5 seconds', backoffCoefficient: 2 },
+  });
+
+const { matchEpisodes } = proxyActivities<Activities>({
   startToCloseTimeout: '10 minutes',
-  retry: {
-    maximumAttempts: 3,
-    initialInterval: '5 seconds',
-    backoffCoefficient: 2,
-  },
+  retry: { maximumAttempts: 3, initialInterval: '5 seconds', backoffCoefficient: 2 },
 });
 
-// Signals
+const { copyEpisodeToWorkDir } = proxyActivities<Activities>({
+  startToCloseTimeout: '30 minutes',
+  heartbeatTimeout: '2 minutes',
+  retry: { maximumAttempts: 2 },
+});
+
+// ── Signals & Queries ────────────────────────────────────────────────
+
 export const reviewDecisionSignal =
   defineSignal<[ReviewDecision]>('reviewDecision');
-
-// Queries
+export const detectionConfirmationSignal =
+  defineSignal<[DetectionConfirmation]>('detectionConfirmation');
 export const getProgressQuery =
   defineQuery<ProcessFolderProgress>('getProgress');
 
+// ── Workflow ─────────────────────────────────────────────────────────
+
 /**
  * Process a single disc folder:
- * 1. Filter files by duration
- * 2. Extract subtitles
- * 3. Match episodes via LLM (across all seasons using seriesMetadata)
- * 4. Rename high-confidence matches immediately
- * 5. Block on low-confidence matches until each is approved via HITL
+ * 1. Detect episode files via file-size clustering
+ * 2. If detection confidence is low/medium, wait for user confirmation
+ * 3. Extract subtitles (stored persistently in _subtitles/)
+ * 4. Match episodes via LLM
+ * 5. Copy-rename high-confidence matches to _episodes/ (idempotent)
+ * 6. Block on low-confidence matches until each is approved via HITL
  *
- * Season numbers come from the LLM match result (informed by the full
- * series metadata), NOT from the disc directory name.
- *
- * Does NOT move files to output — the parent workflow handles publish.
+ * Does NOT move files to staging — the parent workflow handles that.
  */
 export async function processFolder(
   input: ProcessFolderInput,
@@ -86,25 +89,57 @@ export async function processFolder(
       }
     : null;
 
-  // Internal state
+  // ── Internal state ──
   let status: FolderStatus = 'scanning';
-  let totalFiles = 0;
-  let filesProcessed = 0;
+  let totalVideoFiles: number | undefined;
+  let detectedEpisodeCount: number | undefined;
+  let detectionConfidence: 'high' | 'medium' | 'low' | undefined;
+  let totalEpisodeFiles: number | undefined;
+  let subtitlesExtracted = 0;
+  let currentFile: string | undefined;
+  let matchesFound: number | undefined;
+  let totalToMatch: number | undefined;
+  let episodesCopied = 0;
+  let totalEpisodesToCopy: number | undefined;
+
   const pendingReviews: ReviewItem[] = [];
   const resolvedReviews = new Map<string, ReviewDecision>();
   const renamedFiles: RenamedFile[] = [];
 
-  // Handle review decision signals
+  // Detection confirmation state
+  let detectionConfirmed = false;
+  let detectionAddedPaths: string[] = [];
+  let detectionRemovedPaths: string[] = [];
+
+  // ── Signal handlers ──
+
   setHandler(reviewDecisionSignal, (decision: ReviewDecision) => {
     resolvedReviews.set(decision.reviewItemId, decision);
   });
 
-  // Handle progress queries
+  setHandler(
+    detectionConfirmationSignal,
+    (confirmation: DetectionConfirmation) => {
+      detectionConfirmed = true;
+      detectionAddedPaths = confirmation.addedPaths ?? [];
+      detectionRemovedPaths = confirmation.removedPaths ?? [];
+    },
+  );
+
+  // ── Progress query handler ──
   setHandler(getProgressQuery, (): ProcessFolderProgress => ({
     folderName: input.folderName,
     status,
-    totalFiles,
-    filesProcessed,
+    totalVideoFiles,
+    detectedEpisodeCount,
+    detectionConfidence,
+    totalEpisodeFiles,
+    subtitlesExtracted,
+    currentFile,
+    matchesFound,
+    totalToMatch,
+    episodesCopied,
+    totalEpisodesToCopy,
     pendingReviews: pendingReviews.filter(
       (r) =>
         !resolvedReviews.has(r.id) || !resolvedReviews.get(r.id)!.approved,
@@ -112,16 +147,38 @@ export async function processFolder(
   }));
 
   try {
-    // Step 1: List and filter files by duration
+    // ── Step 1: Detect episodes via file-size clustering ──
     status = 'scanning';
-    const allFiles = await listFilesRecursive(input.folderPath);
-    const mediaFiles = await filterByDuration(
-      allFiles,
-      input.minDurationMinutes,
-    );
-    totalFiles = mediaFiles.length;
+    const detection = await detectEpisodeFiles(input.folderPath);
+    totalVideoFiles = detection.episodes.length + detection.nonEpisodes.length;
+    detectedEpisodeCount = detection.episodes.length;
+    detectionConfidence = detection.confidence;
 
-    if (mediaFiles.length === 0) {
+    let episodeFiles: SourceFileInfo[] = [...detection.episodes];
+
+    // ── Step 2: If confidence is not high, wait for user confirmation ──
+    if (detection.confidence !== 'high' && detection.episodes.length > 0) {
+      status = 'awaiting_detection_review';
+      await condition(() => detectionConfirmed);
+
+      // Apply user corrections
+      if (detectionRemovedPaths.length > 0) {
+        const removeSet = new Set(detectionRemovedPaths);
+        episodeFiles = episodeFiles.filter((f) => !removeSet.has(f.path));
+      }
+      if (detectionAddedPaths.length > 0) {
+        const addSet = new Set(detectionAddedPaths);
+        const addedFiles = detection.nonEpisodes.filter((f) =>
+          addSet.has(f.path),
+        );
+        episodeFiles.push(...addedFiles);
+      }
+
+      detectedEpisodeCount = episodeFiles.length;
+    }
+
+    if (episodeFiles.length === 0) {
+      status = 'completed';
       return {
         folderName: input.folderName,
         status: 'completed',
@@ -129,49 +186,60 @@ export async function processFolder(
         episodesRenamed: 0,
         episodesPendingReview: 0,
         renamedFiles: [],
+        episodeOriginalPaths: [],
         unprocessedFiles: [],
       };
     }
 
-    // Step 2: Extract subtitles from each file
+    // ── Step 3: Extract subtitles (persistent, idempotent) ──
     status = 'extracting';
-    const extractedSubtitles = [];
-    for (const mediaFile of mediaFiles) {
-      const subs = await extractSubtitles(mediaFile);
+    totalEpisodeFiles = episodeFiles.length;
+    subtitlesExtracted = 0;
+
+    const subtitlesDir = `${input.seriesRootDir}/_subtitles/${input.folderName}`;
+    const extractedSubtitles: ExtractedSubtitles[] = [];
+
+    for (const file of episodeFiles) {
+      currentFile = file.name;
+      const subs = await extractSubtitleToDir(
+        file.path,
+        file.name,
+        subtitlesDir,
+      );
       if (subs) {
         extractedSubtitles.push(subs);
       }
-      filesProcessed++;
+      subtitlesExtracted++;
     }
+    currentFile = undefined;
 
     if (extractedSubtitles.length === 0) {
+      status = 'failed';
       return {
         folderName: input.folderName,
         status: 'failed',
-        episodesFound: mediaFiles.length,
+        episodesFound: episodeFiles.length,
         episodesRenamed: 0,
         episodesPendingReview: 0,
         renamedFiles: [],
-        unprocessedFiles: mediaFiles.map((f) => f.path),
+        episodeOriginalPaths: episodeFiles.map((f) => f.path),
+        unprocessedFiles: episodeFiles.map((f) => f.path),
         error: 'Could not extract subtitles from any file',
       };
     }
 
-    // Step 3: Match episodes via LLM (using full series metadata across all seasons)
+    // ── Step 4: Match episodes via LLM ──
     status = 'matching';
-    const matchResult = await matchEpisodes(
-      extractedSubtitles,
-      seriesMetadata,
-    );
+    totalToMatch = extractedSubtitles.length;
+    const matchResult = await matchEpisodes(extractedSubtitles, seriesMetadata);
+    matchesFound = matchResult.matches.length;
 
-    // Step 4: Process matches
+    // ── Step 5: Split matches by confidence and copy-rename ──
     status = 'renaming';
     const highConfidence: EpisodeMatch[] = [];
     const lowConfidence: EpisodeMatch[] = [];
-    const matchedFilePaths = new Set<string>();
 
     for (const match of matchResult.matches) {
-      matchedFilePaths.add(match.filePath);
       if (match.confidence >= input.confidenceThreshold) {
         highConfidence.push(match);
       } else {
@@ -179,22 +247,33 @@ export async function processFolder(
       }
     }
 
-    // Rename high-confidence matches immediately
+    totalEpisodesToCopy = highConfidence.length + lowConfidence.length;
+    episodesCopied = 0;
+
+    // Copy-rename high-confidence matches
+    const episodesDir = `${input.seriesRootDir}/_episodes`;
     if (animeForRename) {
       for (const match of highConfidence) {
-        const renamed = await renameFile(match, animeForRename, input.dryRun);
+        currentFile = match.fileName;
+        const renamed = await copyEpisodeToWorkDir(
+          match,
+          animeForRename,
+          episodesDir,
+          input.seriesRootDir,
+          input.dryRun,
+        );
         renamedFiles.push(renamed);
+        episodesCopied++;
       }
     }
+    currentFile = undefined;
 
-    // Handle low-confidence matches via HITL (block-finalize)
+    // ── Step 6: HIL for low-confidence matches ──
     if (lowConfidence.length > 0) {
       status = 'awaiting_review';
 
-      // Flatten all episodes across seasons for the review UI
       const allEpisodes = seriesMetadata.seasons.flatMap((s) => s.episodes);
 
-      // Create review items for each low-confidence match
       for (const match of lowConfidence) {
         const subtitle = extractedSubtitles.find(
           (s) => s.fileName === match.fileName,
@@ -216,17 +295,14 @@ export async function processFolder(
         pendingReviews.push(reviewItem);
       }
 
-      // Block-finalize: wait for every review to receive an approved decision.
-      // Rejected decisions are cleared so the user can re-submit with a correction.
+      // Block-finalize: wait for every review to receive an approved decision
       for (const review of pendingReviews) {
-        // Loop until this review item is approved
         while (true) {
           await condition(() => resolvedReviews.has(review.id));
 
           const decision = resolvedReviews.get(review.id)!;
 
           if (decision.approved && animeForRename) {
-            // Use corrected season/episode if provided, else the original suggestion
             const seasonNumber =
               decision.correctedSeasonNumber ??
               review.suggestedSeasonNumber;
@@ -234,7 +310,6 @@ export async function processFolder(
               decision.correctedEpisodeNumber ??
               review.suggestedEpisodeNumber;
 
-            // Find the episode title from the correct season
             const season = seriesMetadata.seasons.find(
               (s) => s.seasonNumber === seasonNumber,
             );
@@ -248,17 +323,22 @@ export async function processFolder(
               seasonNumber,
               episodeNumber,
               episodeTitle,
-              confidence: 1.0, // User-confirmed
+              confidence: 1.0,
               reasoning: 'User-approved',
             };
 
-            const renamed = await renameFile(
+            currentFile = review.fileName;
+            const renamed = await copyEpisodeToWorkDir(
               correctedMatch,
               animeForRename,
+              episodesDir,
+              input.seriesRootDir,
               input.dryRun,
             );
             renamedFiles.push(renamed);
-            break; // This review is done
+            episodesCopied++;
+            currentFile = undefined;
+            break;
           }
 
           if (!animeForRename) break;
@@ -269,11 +349,14 @@ export async function processFolder(
       }
     }
 
-    // Determine unprocessed files: video files that weren't matched to any episode
+    // Collect all original episode paths for the parent workflow
+    const episodeOriginalPaths = episodeFiles.map((f) => f.path);
+
+    // Determine unprocessed files
     const renamedOriginalPaths = new Set(
       renamedFiles.map((r) => r.originalPath),
     );
-    const unprocessedFiles = mediaFiles
+    const unprocessedFiles = episodeFiles
       .map((f) => f.path)
       .filter((p) => !renamedOriginalPaths.has(p));
 
@@ -281,10 +364,11 @@ export async function processFolder(
     return {
       folderName: input.folderName,
       status: 'completed',
-      episodesFound: mediaFiles.length,
+      episodesFound: episodeFiles.length,
       episodesRenamed: renamedFiles.length,
       episodesPendingReview: 0,
       renamedFiles,
+      episodeOriginalPaths,
       unprocessedFiles,
     };
   } catch (err) {
@@ -293,7 +377,7 @@ export async function processFolder(
     return {
       folderName: input.folderName,
       status: 'failed',
-      episodesFound: totalFiles,
+      episodesFound: totalVideoFiles ?? 0,
       episodesRenamed: renamedFiles.length,
       episodesPendingReview: pendingReviews.filter(
         (r) =>
@@ -301,6 +385,7 @@ export async function processFolder(
           !resolvedReviews.get(r.id)!.approved,
       ).length,
       renamedFiles,
+      episodeOriginalPaths: [],
       unprocessedFiles: [],
       error: errorMessage,
     };

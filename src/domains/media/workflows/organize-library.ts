@@ -20,43 +20,46 @@ import type {
   OrganizeLibraryInput,
   OrganizeLibraryResult,
   OrganizeLibraryProgress,
+  CopyProgress,
+  MetadataSummary,
+  StructuringProgress,
+  OutputProgress,
   ProcessFolderInput,
   ProcessFolderResult,
   FolderStatus,
   FolderResult,
   FinalizeDecision,
   WorkflowStage,
+  SeasonInfo,
   SeriesMetadata,
   FileTreeNode,
+  SourceFileInfo,
 } from '../../../shared/types';
 import { processFolder } from './process-folder';
 
-// ── Activity proxies with appropriate NAS timeouts ──────────────────
+// ── Activity proxies ─────────────────────────────────────────────────
 
-/** Scanning is fast even over NFS */
 const { scanDirectory } = proxyActivities<Activities>({
   startToCloseTimeout: '2 minutes',
 });
 
-/** Metadata fetching (AniList API, including relation traversal) */
-const { fetchSeriesMetadata } = proxyActivities<Activities>({
-  startToCloseTimeout: '5 minutes',
-  retry: { maximumAttempts: 3 },
-});
+const { searchAnimeByName, discoverAllSeasons, fetchSeasonEpisodes } =
+  proxyActivities<Activities>({
+    startToCloseTimeout: '5 minutes',
+    retry: { maximumAttempts: 3 },
+  });
 
-/** Copying a large series from NAS input to processing can be slow */
-const { copyToProcessing } = proxyActivities<Activities>({
+const { enumerateSourceFiles, copySingleFile } = proxyActivities<Activities>({
   startToCloseTimeout: '30 minutes',
   heartbeatTimeout: '2 minutes',
   retry: { maximumAttempts: 2 },
 });
 
-/** Structuring, merging, and cleanup involve moderate-to-large NAS copies */
 const {
-  structureToStaging,
-  mergeToOutput,
-  cleanupProcessing,
-  cleanupStaging,
+  structureInProcessing,
+  copySingleFileToOutput,
+  verifyOutputIntegrity,
+  cleanupDirectory,
   listStagingTree,
 } = proxyActivities<Activities>({
   startToCloseTimeout: '30 minutes',
@@ -64,7 +67,7 @@ const {
   retry: { maximumAttempts: 2 },
 });
 
-// ── Signals & Queries ───────────────────────────────────────────────
+// ── Signals & Queries ────────────────────────────────────────────────
 
 export const getProgressQuery =
   defineQuery<OrganizeLibraryProgress>('getProgress');
@@ -72,35 +75,17 @@ export const getStagingTreeQuery =
   defineQuery<FileTreeNode[]>('getStagingTree');
 export const finalizeSignal = defineSignal<[FinalizeDecision]>('finalize');
 
-/** Maximum number of folders to process in parallel */
+/** Maximum parallel file copies */
+const MAX_PARALLEL_COPIES = 4;
+/** Maximum parallel folder processing */
 const MAX_PARALLEL_FOLDERS = 5;
 
-// ── Workflow ────────────────────────────────────────────────────────
+// ── Workflow ─────────────────────────────────────────────────────────
 
-/**
- * Parent workflow: organizes a single anime series.
- *
- * Phase 1 — Processing:
- *   1. Copy series root to processing dir (input is read-only)
- *   2. Fetch full series metadata (all seasons) from AniList
- *   3. Detect disc structure
- *   4. Spawn processFolder child for each disc (block-finalize HIL)
- *
- * Phase 2 — Staging:
- *   5. Structure into Plex-compatible layout in staging dir
- *   6. Capture staging file tree for user review
- *   7. Clean up processing dir
- *   8. Await explicit finalize signal from user
- *
- * Phase 3 — Output:
- *   9. Merge staging into output (handles existing series dirs)
- *  10. Clean up staging dir
- */
 export async function organizeLibrary(
   input: OrganizeLibraryInput,
 ): Promise<OrganizeLibraryResult> {
   const confidenceThreshold = input.confidenceThreshold ?? 0.85;
-  const minDurationMinutes = input.minDurationMinutes ?? 20;
 
   // ── Mutable state ──
   let workflowStage: WorkflowStage = 'copying';
@@ -110,17 +95,27 @@ export async function organizeLibrary(
   let canFinalize = false;
   let awaitingFinalApproval = false;
   let finalized = false;
+  let rejected = false;
   let stagingTree: FileTreeNode[] = [];
+
+  // Stage-specific progress
+  let copyProgress: CopyProgress | undefined;
+  let metadataSummary: MetadataSummary | undefined;
+  let structuringProgress: StructuringProgress | undefined;
+  let outputProgress: OutputProgress | undefined;
 
   const folderStatuses: Record<string, FolderStatus> = {};
   const folderResults: FolderResult[] = [];
   const allRenamedFilePaths: string[] = [];
+  const allEpisodeOriginalPaths: string[] = [];
   const allExtraFiles: string[] = [];
 
   // ── Finalize signal handler ──
   setHandler(finalizeSignal, (decision: FinalizeDecision) => {
     if (decision.approved && canFinalize) {
       finalized = true;
+    } else if (!decision.approved) {
+      rejected = true;
     }
   });
 
@@ -128,6 +123,11 @@ export async function organizeLibrary(
   setHandler(getProgressQuery, (): OrganizeLibraryProgress => {
     const statuses = Object.values(folderStatuses);
     return {
+      workflowStage,
+      copyProgress,
+      metadataSummary,
+      structuringProgress,
+      outputProgress,
       totalFolders: Object.keys(folderStatuses).length,
       foldersCompleted: statuses.filter((s) => s === 'completed').length,
       foldersFailed: statuses.filter((s) => s === 'failed').length,
@@ -136,13 +136,13 @@ export async function organizeLibrary(
           s !== 'completed' &&
           s !== 'failed' &&
           s !== 'pending' &&
-          s !== 'awaiting_review',
+          s !== 'awaiting_review' &&
+          s !== 'awaiting_detection_review',
       ).length,
       foldersPendingReview: statuses.filter(
-        (s) => s === 'awaiting_review',
+        (s) => s === 'awaiting_review' || s === 'awaiting_detection_review',
       ).length,
       folderStatuses: { ...folderStatuses },
-      workflowStage,
       expectedCoreEpisodeCount,
       resolvedCoreEpisodeCount,
       unresolvedCoreEpisodeCount,
@@ -152,61 +152,131 @@ export async function organizeLibrary(
   });
 
   // ── Staging tree query handler ──
-  setHandler(getStagingTreeQuery, (): FileTreeNode[] => {
-    return stagingTree;
-  });
+  setHandler(getStagingTreeQuery, (): FileTreeNode[] => stagingTree);
 
-  // ════════════════════════════════════════════════════════════════════
-  // Phase 1: Processing
-  // ════════════════════════════════════════════════════════════════════
-
-  // ── Step 1: Copy to processing ──
   const wfId = workflowInfo().workflowId;
-  const processingSeriesDir = await copyToProcessing(
+  const processingRoot = input.processingRoot ?? '/mnt/media/processing';
+  const stagingRoot = input.stagingRoot ?? '/mnt/media/staging';
+  const outputRoot = input.outputRoot ?? '/mnt/media/output';
+
+  // ════════════════════════════════════════════════════════════════════
+  // Stage 1: COPYING — enumerate + parallel copy to processing
+  // ════════════════════════════════════════════════════════════════════
+
+  workflowStage = 'copying';
+  const sourceFiles = await enumerateSourceFiles(input.sourceDir);
+
+  const seriesName = resolveShowName(input.sourceDir);
+  const processingSeriesDir = `${processingRoot}/${wfId}/${seriesName}`;
+  const processingWorkflowDir = `${processingRoot}/${wfId}`;
+
+  copyProgress = {
+    totalFiles: sourceFiles.length,
+    filesCopied: 0,
+    totalBytes: sourceFiles.reduce((sum, f) => sum + f.size, 0),
+    bytesCopied: 0,
+    currentFiles: [],
+    currentFileSizes: [],
+  };
+
+  // Parallel sliding window copy
+  await parallelCopyFiles(
+    sourceFiles,
     input.sourceDir,
-    wfId,
+    processingSeriesDir,
+    copyProgress,
     input.dryRun,
   );
-  // The processing workflow dir is the parent of the series dir
-  // e.g., processing/{wfId}/SeriesName → parent is processing/{wfId}
-  const processingWorkflowDir = processingSeriesDir.substring(
-    0,
-    processingSeriesDir.lastIndexOf('/'),
-  );
 
-  // ── Step 2: Fetch full series metadata (all seasons) ──
-  workflowStage = 'detecting';
-  const seriesName = resolveShowName(input.sourceDir);
-  const seriesMetadata = await fetchSeriesMetadata(seriesName);
+  // ════════════════════════════════════════════════════════════════════
+  // Stage 2: FETCHING METADATA — AniList search, season traversal
+  // ════════════════════════════════════════════════════════════════════
 
-  if (!seriesMetadata || seriesMetadata.seasons.length === 0) {
+  workflowStage = 'fetching_metadata';
+  metadataSummary = { status: 'searching' };
+
+  const anime = await searchAnimeByName(seriesName);
+  if (!anime) {
     workflowStage = 'failed';
-    await cleanupProcessing(processingWorkflowDir, input.dryRun);
-    return {
-      totalFolders: 0,
-      completed: 0,
-      failed: 0,
-      pendingReview: 0,
-      folders: [],
-      extraFiles: [],
+    return emptyResult();
+  }
+
+  metadataSummary = {
+    status: 'found',
+    seriesName: anime.title.english ?? anime.title.romaji,
+  };
+
+  // Discover all seasons
+  metadataSummary = { ...metadataSummary, status: 'traversing' };
+  const seasonEntries = await discoverAllSeasons(anime.anilistId);
+
+  if (seasonEntries.length === 0) {
+    workflowStage = 'failed';
+    return emptyResult();
+  }
+
+  metadataSummary = {
+    ...metadataSummary,
+    status: 'fetching_episodes',
+    seasonCount: seasonEntries.length,
+    seasons: [],
+  };
+
+  // Fetch episodes for each season
+  const seasons: SeasonInfo[] = [];
+  for (let i = 0; i < seasonEntries.length; i++) {
+    const entry = seasonEntries[i];
+    const episodes = await fetchSeasonEpisodes(
+      entry.anilistId,
+      entry.episodeCount,
+    );
+    const seasonInfo: SeasonInfo = {
+      seasonNumber: i + 1,
+      anilistId: entry.anilistId,
+      title: entry.title,
+      episodeCount: entry.episodeCount,
+      episodes,
+    };
+    seasons.push(seasonInfo);
+
+    metadataSummary = {
+      ...metadataSummary,
+      seasons: [
+        ...(metadataSummary.seasons ?? []),
+        {
+          seasonNumber: i + 1,
+          title: entry.title.english ?? entry.title.romaji,
+          episodeCount: entry.episodeCount,
+        },
+      ],
     };
   }
 
-  expectedCoreEpisodeCount = seriesMetadata.totalCoreEpisodes;
+  const seriesMetadata: SeriesMetadata = {
+    seriesName: anime.title.english ?? anime.title.romaji ?? seriesName,
+    seasons,
+    totalCoreEpisodes: seasons.reduce((sum, s) => sum + s.episodeCount, 0),
+  };
 
-  // ── Step 3: Detect disc structure ──
+  expectedCoreEpisodeCount = seriesMetadata.totalCoreEpisodes;
+  metadataSummary = {
+    ...metadataSummary,
+    status: 'complete',
+    totalEpisodes: expectedCoreEpisodeCount,
+  };
+
+  // ════════════════════════════════════════════════════════════════════
+  // Stage 3: PROCESSING FOLDERS — scan, detect, extract, match, rename
+  // ════════════════════════════════════════════════════════════════════
+
+  workflowStage = 'processing_folders';
+
+  // Scan disc structure
   const subdirs = await scanDirectory(processingSeriesDir);
 
-  // Build the list of folders (discs) to process.
-  // Flat structure (no subdirs): treat the series root itself as one folder.
-  // Nested structure (Disc 01/, Disc 02/, etc.): each subdir is a disc.
-  // NOTE: disc numbers are NOT season numbers. The LLM + metadata determine seasons.
   let foldersToProcess: Array<{ name: string; path: string }>;
-
   if (subdirs.length === 0) {
-    foldersToProcess = [
-      { name: seriesName, path: processingSeriesDir },
-    ];
+    foldersToProcess = [{ name: seriesName, path: processingSeriesDir }];
   } else {
     foldersToProcess = subdirs.map((dir) => ({
       name: dir.name,
@@ -219,8 +289,7 @@ export async function organizeLibrary(
     folderStatuses[folder.name] = 'pending';
   }
 
-  // ── Step 4: Process discs in parallel ──
-  workflowStage = 'extracting';
+  // Process folders in parallel (sliding window of MAX_PARALLEL_FOLDERS)
   const pendingFolders = [...foldersToProcess];
   const inFlightPromises = new Map<string, Promise<ProcessFolderResult>>();
 
@@ -236,9 +305,9 @@ export async function organizeLibrary(
       const childInput: ProcessFolderInput = {
         folderPath: folder.path,
         folderName: folder.name,
+        seriesRootDir: processingSeriesDir,
         seriesMetadata,
         dryRun: input.dryRun,
-        minDurationMinutes,
         confidenceThreshold,
       };
 
@@ -272,22 +341,13 @@ export async function organizeLibrary(
         error: result.error,
       });
 
-      // Aggregate episode counts
       resolvedCoreEpisodeCount += result.episodesRenamed;
 
-      // Collect renamed file paths for output structuring
       for (const rf of result.renamedFiles) {
         allRenamedFilePaths.push(rf.newPath);
       }
-
-      // Update stage based on what's still happening
-      const hasAwaitingReview = Object.values(folderStatuses).some(
-        (s) => s === 'awaiting_review',
-      );
-      if (hasAwaitingReview) {
-        workflowStage = 'awaiting_review';
-      } else if (pendingFolders.length > 0 || inFlightPromises.size > 1) {
-        workflowStage = 'matching';
+      for (const origPath of result.episodeOriginalPaths) {
+        allEpisodeOriginalPaths.push(origPath);
       }
 
       inFlightPromises.delete(name);
@@ -295,10 +355,54 @@ export async function organizeLibrary(
   }
 
   // ════════════════════════════════════════════════════════════════════
-  // Phase 2: Staging
+  // Stage 4: STRUCTURING — build Plex layout in processing, copy to staging
   // ════════════════════════════════════════════════════════════════════
 
-  // All children done. Since children block-finalize, every episode is resolved.
+  workflowStage = 'structuring';
+  const showName = seriesMetadata.seriesName;
+
+  // Build _structured/ in processing
+  const { structuredDir, extraFiles, totalFiles } =
+    await structureInProcessing(
+      processingSeriesDir,
+      showName,
+      allEpisodeOriginalPaths,
+      input.dryRun,
+    );
+  allExtraFiles.push(...extraFiles);
+
+  // Copy _structured/ShowName/ to staging
+  const cleanShowName = showName
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const stagingShowDir = `${stagingRoot}/${wfId}/${cleanShowName}`;
+  const stagingWorkflowDir = `${stagingRoot}/${wfId}`;
+
+  const structuredFiles = await enumerateSourceFiles(structuredDir);
+  structuringProgress = {
+    totalFiles: structuredFiles.length,
+    filesStructured: 0,
+  };
+
+  // Parallel copy to staging
+  await parallelCopyFiles(
+    structuredFiles,
+    structuredDir,
+    stagingShowDir,
+    structuringProgress as unknown as CopyProgress,
+    input.dryRun,
+  );
+
+  // Capture staging tree
+  if (!input.dryRun) {
+    stagingTree = await listStagingTree(stagingShowDir);
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // Stage 5: AWAITING FINALIZE — user reviews and approves/rejects
+  // ════════════════════════════════════════════════════════════════════
+
   const totalCompleted = folderResults.filter(
     (r) => r.status === 'completed',
   ).length;
@@ -308,50 +412,116 @@ export async function organizeLibrary(
   unresolvedCoreEpisodeCount = 0;
   resolvedCoreEpisodeCount = allRenamedFilePaths.length;
 
-  // ── Step 5: Structure into staging ──
-  workflowStage = 'structuring';
-  const showName = seriesMetadata.seriesName;
-  const { stagingShowDir, extraFiles } = await structureToStaging(
-    processingSeriesDir,
-    wfId,
-    showName,
-    allRenamedFilePaths,
-    input.dryRun,
-  );
-  allExtraFiles.push(...extraFiles);
-
-  // The staging workflow dir is the parent of the show dir
-  // e.g., staging/{wfId}/ShowName → parent is staging/{wfId}
-  const stagingWorkflowDir = stagingShowDir.substring(
-    0,
-    stagingShowDir.lastIndexOf('/'),
-  );
-
-  // ── Step 6: Capture staging file tree for user review ──
-  stagingTree = await listStagingTree(stagingShowDir);
-
-  // ── Step 7: Clean up processing ──
-  await cleanupProcessing(processingWorkflowDir, input.dryRun);
-
-  // ── Step 8: Await finalize signal from user ──
   canFinalize = totalFailed === 0 && allRenamedFilePaths.length > 0;
   awaitingFinalApproval = canFinalize;
   workflowStage = 'awaiting_finalize';
 
   if (canFinalize) {
-    await condition(() => finalized);
+    await condition(() => finalized || rejected);
+  }
+
+  // Handle rejection
+  if (rejected) {
+    workflowStage = 'failed';
+    return {
+      totalFolders: folderResults.length,
+      completed: totalCompleted,
+      failed: totalFailed,
+      pendingReview: 0,
+      folders: folderResults,
+      extraFiles: allExtraFiles,
+    };
   }
 
   // ════════════════════════════════════════════════════════════════════
-  // Phase 3: Output
+  // Stage 6: FINALIZING — parallel copy to output, verify, cleanup
   // ════════════════════════════════════════════════════════════════════
 
-  // ── Step 9: Merge staging into output ──
   workflowStage = 'finalizing';
-  await mergeToOutput(stagingShowDir, showName, input.dryRun);
+  const outputDir = `${outputRoot}/${cleanShowName}`;
 
-  // ── Step 10: Clean up staging ──
-  await cleanupStaging(stagingWorkflowDir, input.dryRun);
+  const stagingFiles = await enumerateSourceFiles(stagingShowDir);
+  outputProgress = {
+    totalFiles: stagingFiles.length,
+    filesCopied: 0,
+    currentFiles: [],
+  };
+
+  // Parallel copy staging → output
+  if (!input.dryRun) {
+    const outputPending = [...stagingFiles];
+    const outputInFlight = new Map<string, Promise<void>>();
+    const outputCompleted = new Set<string>();
+
+    while (outputPending.length > 0 || outputInFlight.size > 0) {
+      while (
+        outputPending.length > 0 &&
+        outputInFlight.size < MAX_PARALLEL_COPIES
+      ) {
+        const file = outputPending.shift()!;
+        const fileName = file.name;
+        outputProgress = {
+          ...outputProgress!,
+          currentFiles: [
+            ...outputProgress!.currentFiles.filter((f) =>
+              outputInFlight.has(f),
+            ),
+            fileName,
+          ],
+        };
+
+        const promise = copySingleFileToOutput(
+          file.path,
+          stagingShowDir,
+          outputDir,
+        ).then(() => {
+          outputProgress = {
+            ...outputProgress!,
+            filesCopied: outputProgress!.filesCopied + 1,
+            currentFiles: outputProgress!.currentFiles.filter(
+              (f) => f !== fileName,
+            ),
+          };
+          outputCompleted.add(fileName);
+        });
+
+        outputInFlight.set(fileName, promise);
+      }
+
+      if (outputInFlight.size > 0) {
+        await Promise.race(Array.from(outputInFlight.values()));
+        // Remove completed entries
+        for (const name of outputCompleted) {
+          outputInFlight.delete(name);
+        }
+        outputCompleted.clear();
+      }
+    }
+  }
+
+  // Verify output integrity
+  if (!input.dryRun) {
+    const { verified, missingFiles } = await verifyOutputIntegrity(
+      stagingShowDir,
+      outputDir,
+    );
+
+    if (!verified) {
+      workflowStage = 'failed';
+      return {
+        totalFolders: folderResults.length,
+        completed: totalCompleted,
+        failed: totalFailed,
+        pendingReview: 0,
+        folders: folderResults,
+        extraFiles: allExtraFiles,
+      };
+    }
+  }
+
+  // Cleanup staging and processing
+  await cleanupDirectory(stagingWorkflowDir, input.dryRun);
+  await cleanupDirectory(processingWorkflowDir, input.dryRun);
 
   workflowStage = 'completed';
   return {
@@ -364,19 +534,87 @@ export async function organizeLibrary(
   };
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
+// ── Parallel Copy Helper ─────────────────────────────────────────────
 
 /**
- * Extract the show name from the source directory path.
- * Uses the directory basename, which is the series folder name on the NAS.
+ * Copy files in parallel using a sliding window of MAX_PARALLEL_COPIES.
+ * Updates the provided progress object between each completion.
  */
+async function parallelCopyFiles(
+  files: SourceFileInfo[],
+  sourceRoot: string,
+  destRoot: string,
+  progress: CopyProgress | StructuringProgress,
+  dryRun?: boolean,
+): Promise<void> {
+  if (dryRun) return;
+
+  const pending = [...files];
+  const inFlight = new Map<string, Promise<void>>();
+  const completed = new Set<string>();
+  const isCopyProgress = 'bytesCopied' in progress;
+
+  while (pending.length > 0 || inFlight.size > 0) {
+    while (pending.length > 0 && inFlight.size < MAX_PARALLEL_COPIES) {
+      const file = pending.shift()!;
+      const destPath = `${destRoot}/${file.relativePath}`;
+
+      if (isCopyProgress) {
+        const cp = progress as CopyProgress;
+        cp.currentFiles = [...cp.currentFiles, file.name];
+        cp.currentFileSizes = [...cp.currentFileSizes, file.size];
+      } else {
+        (progress as StructuringProgress).currentFile = file.name;
+      }
+
+      const fileName = file.name;
+      const fileSize = file.size;
+      const promise = copySingleFile(file.path, destPath).then(() => {
+        if (isCopyProgress) {
+          const cp = progress as CopyProgress;
+          cp.filesCopied++;
+          cp.bytesCopied += fileSize;
+          cp.currentFiles = cp.currentFiles.filter((f) => f !== fileName);
+          cp.currentFileSizes = cp.currentFileSizes.filter(
+            (_, i) => cp.currentFiles[i] !== undefined,
+          );
+        } else {
+          (progress as StructuringProgress).filesStructured++;
+        }
+        completed.add(fileName);
+      });
+
+      inFlight.set(fileName, promise);
+    }
+
+    if (inFlight.size > 0) {
+      await Promise.race(Array.from(inFlight.values()));
+      // Remove completed entries from the in-flight map
+      for (const name of completed) {
+        inFlight.delete(name);
+      }
+      completed.clear();
+    }
+  }
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────
+
+function emptyResult(): OrganizeLibraryResult {
+  return {
+    totalFolders: 0,
+    completed: 0,
+    failed: 0,
+    pendingReview: 0,
+    folders: [],
+    extraFiles: [],
+  };
+}
+
 function resolveShowName(sourceDir: string): string {
   return basename(sourceDir);
 }
 
-/**
- * Sanitize a string for use as a Temporal workflow ID component.
- */
 function sanitizeWorkflowId(name: string): string {
   return name
     .replace(/[^a-zA-Z0-9_-]/g, '-')
@@ -384,9 +622,6 @@ function sanitizeWorkflowId(name: string): string {
     .slice(0, 200);
 }
 
-/**
- * Get the basename of a path. Workflow-safe (no Node.js path module).
- */
 function basename(filePath: string): string {
   const parts = filePath.replace(/\/+$/, '').split('/');
   return parts[parts.length - 1] ?? '';

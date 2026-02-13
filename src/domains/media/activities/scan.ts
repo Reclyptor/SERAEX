@@ -31,7 +31,8 @@ export async function scanDirectory(
   const directories: Array<{ name: string; path: string }> = [];
 
   for (const entry of entries) {
-    if (entry.isDirectory()) {
+    // Skip working directories prefixed with _ (e.g. _subtitles, _episodes, _structured)
+    if (entry.isDirectory() && !entry.name.startsWith('_')) {
       const fullPath = join(sourceDir, entry.name);
       directories.push({ name: entry.name, path: fullPath });
     }

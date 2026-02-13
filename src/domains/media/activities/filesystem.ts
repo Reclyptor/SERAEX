@@ -6,94 +6,29 @@ import type {
   AnimeSearchResult,
   RenamedFile,
   FileTreeNode,
+  SourceFileInfo,
 } from '../../../shared/types';
 
-/**
- * Rename a file to Plex naming convention:
- * "Show Name - SXXEXX - Episode Title.ext"
- *
- * Season number comes from the LLM match result (not disc directory name).
- * Renames in-place within the processing directory.
- */
-export async function renameFile(
-  match: EpisodeMatch,
-  anime: AnimeSearchResult,
-  dryRun: boolean = false,
-): Promise<RenamedFile> {
-  const dir = dirname(match.filePath);
-  const ext = extname(match.filePath);
-  const showName = sanitizeFileName(
-    anime.title.english ?? anime.title.romaji,
-  );
-  const episodeNum = String(match.episodeNumber).padStart(2, '0');
-  const seasonNum = String(match.seasonNumber).padStart(2, '0');
-  const episodeTitle = sanitizeFileName(match.episodeTitle);
+// ── Constants ────────────────────────────────────────────────────────
 
-  // Plex naming: "Show Name - S01E01 - Episode Title.mkv"
-  const newFileName = episodeTitle
-    ? `${showName} - S${seasonNum}E${episodeNum} - ${episodeTitle}${ext}`
-    : `${showName} - S${seasonNum}E${episodeNum}${ext}`;
+/** Video file extensions */
+const VIDEO_EXTENSIONS = new Set([
+  '.mkv',
+  '.mp4',
+  '.avi',
+  '.webm',
+  '.m4v',
+  '.mov',
+  '.wmv',
+  '.flv',
+]);
 
-  const newPath = join(dir, newFileName);
-
-  if (!dryRun) {
-    // Avoid overwriting existing files
-    try {
-      await access(newPath);
-      // File already exists at target path
-      throw new Error(`Target file already exists: ${newPath}`);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-      // ENOENT means file doesn't exist, which is what we want
-    }
-
-    await rename(match.filePath, newPath);
-    console.log(`Renamed: ${match.fileName} -> ${newFileName}`);
-  } else {
-    console.log(`[DRY RUN] Would rename: ${match.fileName} -> ${newFileName}`);
-  }
-
-  return {
-    originalPath: match.filePath,
-    newPath,
-    newFileName,
-    seasonNumber: match.seasonNumber,
-    episodeNumber: match.episodeNumber,
-  };
+/** Directories prefixed with _ are working dirs and should be ignored */
+function isWorkDir(name: string): boolean {
+  return name.startsWith('_');
 }
 
-/**
- * Copy an entire selected series directory into the processing area.
- * The input directory is never modified.
- * Reads MEDIA_PROCESSING_ROOT from the worker's environment.
- */
-export async function copyToProcessing(
-  sourceSeriesDir: string,
-  workflowId: string,
-  dryRun: boolean = false,
-): Promise<string> {
-  const processingRoot =
-    process.env.MEDIA_PROCESSING_ROOT ?? '/mnt/media/processing';
-  const processingSeriesDir = join(
-    processingRoot,
-    workflowId,
-    basename(sourceSeriesDir),
-  );
-  if (dryRun) {
-    console.log(
-      `[DRY RUN] Would copy series to processing: ${sourceSeriesDir} -> ${processingSeriesDir}`,
-    );
-    return processingSeriesDir;
-  }
-  await mkdir(dirname(processingSeriesDir), { recursive: true });
-  await withHeartbeat(() =>
-    cp(sourceSeriesDir, processingSeriesDir, { recursive: true }),
-  );
-  console.log(
-    `Copied series to processing: ${sourceSeriesDir} -> ${processingSeriesDir}`,
-  );
-  return processingSeriesDir;
-}
+// ── Heartbeat helper ─────────────────────────────────────────────────
 
 /**
  * Run an async operation while sending Temporal heartbeats on a timer.
@@ -111,165 +46,296 @@ async function withHeartbeat<T>(fn: () => Promise<T>): Promise<T> {
   }
 }
 
-/** Video file extensions */
-const VIDEO_EXTENSIONS = new Set([
-  '.mkv',
-  '.mp4',
-  '.avi',
-  '.webm',
-  '.m4v',
-  '.mov',
-  '.wmv',
-  '.flv',
-]);
+// ── File Enumeration ─────────────────────────────────────────────────
 
 /**
- * Build Plex-compatible directory structure in staging from a processed series.
- *
- * Takes the processing directory (where episodes have been renamed in-place by
- * processFolder) and produces:
- *
- *   <stagingRoot>/<wfId>/<ShowName>/
- *     Season 01/
- *       Show Name - S01E01 - Title.mkv
- *     Extras/
- *       <non-episode videos, preserving relative path from processing dir>
- *
- * Reads MEDIA_STAGING_ROOT from the worker's environment.
+ * Recursively list all files under a directory with sizes.
+ * Used to enumerate files before parallel copy operations.
  */
-export async function structureToStaging(
+export async function enumerateSourceFiles(
+  rootDir: string,
+): Promise<SourceFileInfo[]> {
+  const files: SourceFileInfo[] = [];
+  await walkDir(rootDir, rootDir, files);
+  return files;
+}
+
+async function walkDir(
+  currentDir: string,
+  rootDir: string,
+  out: SourceFileInfo[],
+): Promise<void> {
+  const entries = await readdir(currentDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      await walkDir(fullPath, rootDir, out);
+    } else if (entry.isFile()) {
+      const fileStat = await stat(fullPath);
+      out.push({
+        path: fullPath,
+        relativePath: relative(rootDir, fullPath),
+        name: entry.name,
+        size: fileStat.size,
+      });
+    }
+  }
+}
+
+// ── Single File Copy ─────────────────────────────────────────────────
+
+/**
+ * Copy a single file from source to destination.
+ * Creates parent directories as needed. Heartbeated for large files.
+ */
+export async function copySingleFile(
+  src: string,
+  dest: string,
+): Promise<{ bytesWritten: number }> {
+  await mkdir(dirname(dest), { recursive: true });
+  const fileStat = await stat(src);
+  await withHeartbeat(() => cp(src, dest));
+  console.log(`Copied: ${basename(src)} (${formatBytes(fileStat.size)})`);
+  return { bytesWritten: fileStat.size };
+}
+
+// ── Episode Copy-Rename ──────────────────────────────────────────────
+
+/**
+ * Copy a matched episode file into the `_episodes/` working directory
+ * with the Plex naming convention. Idempotent: skips if target exists.
+ *
+ * This replaces the old `renameFile` activity. Originals are never modified.
+ */
+export async function copyEpisodeToWorkDir(
+  match: EpisodeMatch,
+  anime: AnimeSearchResult,
+  episodesDir: string,
+  seriesRootDir: string,
+  dryRun: boolean = false,
+): Promise<RenamedFile> {
+  const ext = extname(match.filePath);
+  const showName = sanitizeFileName(
+    anime.title.english ?? anime.title.romaji,
+  );
+  const episodeNum = String(match.episodeNumber).padStart(2, '0');
+  const seasonNum = String(match.seasonNumber).padStart(2, '0');
+  const episodeTitle = sanitizeFileName(match.episodeTitle);
+
+  // Plex naming: "Show Name - S01E01 - Episode Title.mkv"
+  const newFileName = episodeTitle
+    ? `${showName} - S${seasonNum}E${episodeNum} - ${episodeTitle}${ext}`
+    : `${showName} - S${seasonNum}E${episodeNum}${ext}`;
+
+  const seasonDir = join(episodesDir, `Season ${seasonNum}`);
+  const newPath = join(seasonDir, newFileName);
+  const originalRelativePath = relative(seriesRootDir, match.filePath);
+
+  if (dryRun) {
+    console.log(`[DRY RUN] Would copy episode: ${match.fileName} -> ${newFileName}`);
+    return { originalPath: match.filePath, originalRelativePath, newPath, newFileName, seasonNumber: match.seasonNumber, episodeNumber: match.episodeNumber };
+  }
+
+  // Idempotent: skip if target already exists
+  try {
+    await access(newPath);
+    console.log(`Episode already copied, skipping: ${newFileName}`);
+    return { originalPath: match.filePath, originalRelativePath, newPath, newFileName, seasonNumber: match.seasonNumber, episodeNumber: match.episodeNumber };
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  }
+
+  await mkdir(seasonDir, { recursive: true });
+  await withHeartbeat(() => cp(match.filePath, newPath));
+  console.log(`Episode copied: ${match.fileName} -> ${newFileName}`);
+
+  return {
+    originalPath: match.filePath,
+    originalRelativePath,
+    newPath,
+    newFileName,
+    seasonNumber: match.seasonNumber,
+    episodeNumber: match.episodeNumber,
+  };
+}
+
+// ── Structure in Processing ──────────────────────────────────────────
+
+/**
+ * Build the final Plex-ready directory structure inside `_structured/`
+ * within the processing series directory.
+ *
+ * - Moves episode files from `_episodes/Season XX/` into
+ *   `_structured/ShowName/Season XX/` (same filesystem = instant rename).
+ * - Copies non-episode video files from original disc dirs into
+ *   `_structured/ShowName/Extras/{relative_path}`.
+ *
+ * All work happens in the processing directory. Nothing touches staging.
+ */
+export async function structureInProcessing(
   processingSeriesDir: string,
-  workflowId: string,
   showName: string,
-  renamedFilePaths: string[],
+  episodeOriginalPaths: string[],
   dryRun: boolean = false,
-): Promise<{ stagingShowDir: string; extraFiles: string[] }> {
-  const stagingRoot =
-    process.env.MEDIA_STAGING_ROOT ?? '/mnt/media/staging';
+): Promise<{ structuredDir: string; extraFiles: string[]; totalFiles: number }> {
   const cleanShowName = sanitizeFileName(showName);
-  const stagingShowDir = join(stagingRoot, workflowId, cleanShowName);
-  const renamedSet = new Set(renamedFilePaths);
+  const structuredShowDir = join(processingSeriesDir, '_structured', cleanShowName);
+  const episodesDir = join(processingSeriesDir, '_episodes');
+  const episodePathSet = new Set(episodeOriginalPaths);
   const extraFiles: string[] = [];
+  let totalFiles = 0;
 
-  const allFiles = await listAllFilesRecursive(processingSeriesDir);
+  // ── Move episodes from _episodes/ to _structured/ShowName/ ──
+  const episodeDirEntries = await safeReaddir(episodesDir);
+  for (const seasonEntry of episodeDirEntries) {
+    if (!seasonEntry.isDirectory()) continue;
+    const seasonName = seasonEntry.name; // e.g., "Season 01"
+    const srcSeasonDir = join(episodesDir, seasonName);
+    const destSeasonDir = join(structuredShowDir, seasonName);
 
-  await withHeartbeat(async () => {
-    for (const filePath of allFiles) {
-      const rel = relative(processingSeriesDir, filePath);
-      const ext = extname(filePath).toLowerCase();
+    const files = await readdir(srcSeasonDir, { withFileTypes: true });
+    for (const file of files) {
+      if (!file.isFile()) continue;
+      const srcPath = join(srcSeasonDir, file.name);
+      const destPath = join(destSeasonDir, file.name);
 
-      if (renamedSet.has(filePath)) {
-        // Episode: extract season from renamed filename (S01E01 pattern)
-        const seasonMatch = basename(filePath).match(/- S(\d{2})E\d{2}/);
-        const seasonDir = seasonMatch
-          ? `Season ${seasonMatch[1]}`
-          : 'Season 01';
-        const destPath = join(stagingShowDir, seasonDir, basename(filePath));
-
-        if (!dryRun) {
-          await mkdir(dirname(destPath), { recursive: true });
-          await cp(filePath, destPath);
-          console.log(`Episode -> ${destPath}`);
-        } else {
-          console.log(`[DRY RUN] Episode -> ${destPath}`);
-        }
-      } else if (VIDEO_EXTENSIONS.has(ext)) {
-        // Non-episode video: Extras preserving relative path
-        const destPath = join(stagingShowDir, 'Extras', rel);
-        extraFiles.push(rel);
-
-        if (!dryRun) {
-          await mkdir(dirname(destPath), { recursive: true });
-          await cp(filePath, destPath);
-          console.log(`Extra -> ${destPath}`);
-        } else {
-          console.log(`[DRY RUN] Extra -> ${destPath}`);
-        }
-      }
-      // Non-video files are silently skipped
-    }
-  });
-
-  return { stagingShowDir, extraFiles };
-}
-
-/**
- * Merge a structured staging show directory into the output library.
- *
- * Walks the staging show dir and copies each file to the corresponding path
- * under output/<ShowName>/. Handles existing directories gracefully — new
- * seasons are created alongside existing ones, extras merge into the existing
- * Extras/ folder.
- *
- * Reads MEDIA_OUTPUT_ROOT from the worker's environment.
- */
-export async function mergeToOutput(
-  stagingShowDir: string,
-  showName: string,
-  dryRun: boolean = false,
-): Promise<{ outputDir: string }> {
-  const outputRoot =
-    process.env.MEDIA_OUTPUT_ROOT ?? '/mnt/media/output';
-  const cleanShowName = sanitizeFileName(showName);
-  const outputDir = join(outputRoot, cleanShowName);
-
-  const allFiles = await listAllFilesRecursive(stagingShowDir);
-
-  await withHeartbeat(async () => {
-    for (const filePath of allFiles) {
-      const rel = relative(stagingShowDir, filePath);
-      const destPath = join(outputDir, rel);
-
-      if (!dryRun) {
-        await mkdir(dirname(destPath), { recursive: true });
-        await cp(filePath, destPath);
-        console.log(`Output -> ${destPath}`);
+      if (dryRun) {
+        console.log(`[DRY RUN] Would move episode: ${srcPath} -> ${destPath}`);
       } else {
-        console.log(`[DRY RUN] Output -> ${destPath}`);
+        await mkdir(destSeasonDir, { recursive: true });
+        await rename(srcPath, destPath); // Same FS, instant
+        console.log(`Episode -> ${destPath}`);
       }
+      totalFiles++;
     }
-  });
+  }
 
-  return { outputDir };
+  // ── Copy non-episode video files to Extras/ ──
+  const allOriginalFiles = await listOriginalFiles(processingSeriesDir);
+  for (const filePath of allOriginalFiles) {
+    if (episodePathSet.has(filePath)) continue;
+
+    const ext = extname(filePath).toLowerCase();
+    if (!VIDEO_EXTENSIONS.has(ext)) continue;
+
+    const rel = relative(processingSeriesDir, filePath);
+    const destPath = join(structuredShowDir, 'Extras', rel);
+    extraFiles.push(rel);
+
+    if (dryRun) {
+      console.log(`[DRY RUN] Extra -> ${destPath}`);
+    } else {
+      await mkdir(dirname(destPath), { recursive: true });
+      await cp(filePath, destPath);
+      console.log(`Extra -> ${destPath}`);
+    }
+    totalFiles++;
+  }
+
+  return { structuredDir: structuredShowDir, extraFiles, totalFiles };
 }
 
 /**
- * Clean up a processing directory after structuring to staging.
+ * List all files in the original disc directories (skipping _ working dirs).
  */
-export async function cleanupProcessing(
-  processingWorkflowDir: string,
-  dryRun: boolean = false,
-): Promise<void> {
-  if (dryRun) {
-    console.log(
-      `[DRY RUN] Would clean up processing: ${processingWorkflowDir}`,
-    );
-    return;
+async function listOriginalFiles(seriesDir: string): Promise<string[]> {
+  const files: string[] = [];
+  const entries = await readdir(seriesDir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    if (isWorkDir(entry.name)) continue;
+    const fullPath = join(seriesDir, entry.name);
+    if (entry.isDirectory()) {
+      const subFiles = await listAllFilesRecursive(fullPath);
+      files.push(...subFiles);
+    } else if (entry.isFile()) {
+      files.push(fullPath);
+    }
   }
-  await withHeartbeat(() =>
-    rm(processingWorkflowDir, { recursive: true, force: true }),
-  );
-  console.log(`Cleaned up processing: ${processingWorkflowDir}`);
+
+  return files;
 }
 
+// ── Single File Copy to Output ───────────────────────────────────────
+
 /**
- * Clean up a staging directory after merging to output.
+ * Copy a single file from a source root to an output root,
+ * preserving its relative path. Used for staging → output copies.
  */
-export async function cleanupStaging(
-  stagingWorkflowDir: string,
+export async function copySingleFileToOutput(
+  filePath: string,
+  sourceRoot: string,
+  outputRoot: string,
+): Promise<{ bytesWritten: number }> {
+  const rel = relative(sourceRoot, filePath);
+  const destPath = join(outputRoot, rel);
+  await mkdir(dirname(destPath), { recursive: true });
+  const fileStat = await stat(filePath);
+  await withHeartbeat(() => cp(filePath, destPath));
+  console.log(`Output -> ${destPath}`);
+  return { bytesWritten: fileStat.size };
+}
+
+// ── Output Integrity Verification ────────────────────────────────────
+
+/**
+ * Verify that every file in the source directory exists in the output
+ * directory with a matching size. Used after copying staging → output.
+ */
+export async function verifyOutputIntegrity(
+  sourceDir: string,
+  outputDir: string,
+): Promise<{ verified: boolean; missingFiles: string[] }> {
+  const sourceFiles = await listAllFilesRecursive(sourceDir);
+  const missingFiles: string[] = [];
+
+  for (const srcFile of sourceFiles) {
+    const rel = relative(sourceDir, srcFile);
+    const destFile = join(outputDir, rel);
+
+    try {
+      const srcStat = await stat(srcFile);
+      const destStat = await stat(destFile);
+
+      if (srcStat.size !== destStat.size) {
+        missingFiles.push(rel);
+        console.warn(`Size mismatch: ${rel} (src=${srcStat.size}, dest=${destStat.size})`);
+      }
+    } catch {
+      missingFiles.push(rel);
+      console.warn(`Missing in output: ${rel}`);
+    }
+  }
+
+  const verified = missingFiles.length === 0;
+  if (verified) {
+    console.log(`Output integrity verified: ${sourceFiles.length} files OK`);
+  } else {
+    console.error(`Output integrity FAILED: ${missingFiles.length} missing/mismatched files`);
+  }
+
+  return { verified, missingFiles };
+}
+
+// ── Cleanup ──────────────────────────────────────────────────────────
+
+/**
+ * Recursively remove a directory. Generalized replacement for the old
+ * separate cleanupProcessing/cleanupStaging functions.
+ */
+export async function cleanupDirectory(
+  directory: string,
   dryRun: boolean = false,
 ): Promise<void> {
   if (dryRun) {
-    console.log(
-      `[DRY RUN] Would clean up staging: ${stagingWorkflowDir}`,
-    );
+    console.log(`[DRY RUN] Would clean up: ${directory}`);
     return;
   }
-  await withHeartbeat(() =>
-    rm(stagingWorkflowDir, { recursive: true, force: true }),
-  );
-  console.log(`Cleaned up staging: ${stagingWorkflowDir}`);
+  await withHeartbeat(() => rm(directory, { recursive: true, force: true }));
+  console.log(`Cleaned up: ${directory}`);
 }
+
+// ── Staging Tree ─────────────────────────────────────────────────────
 
 /**
  * Build a recursive file tree structure for a directory.
@@ -321,9 +387,8 @@ async function buildTree(
   return nodes;
 }
 
-/**
- * Recursively list all files in a directory.
- */
+// ── Helpers ──────────────────────────────────────────────────────────
+
 async function listAllFilesRecursive(directory: string): Promise<string[]> {
   const entries = await readdir(directory, { withFileTypes: true });
   const files: string[] = [];
@@ -341,13 +406,26 @@ async function listAllFilesRecursive(directory: string): Promise<string[]> {
   return files;
 }
 
-/**
- * Sanitize a string for use as a file name.
- * Removes or replaces characters that are invalid in file systems.
- */
+async function safeReaddir(
+  dir: string,
+): Promise<import('fs').Dirent[]> {
+  try {
+    return await readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+}
+
 function sanitizeFileName(name: string): string {
   return name
-    .replace(/[<>:"/\\|?*]/g, '') // Remove invalid characters
-    .replace(/\s+/g, ' ') // Collapse whitespace
+    .replace(/[<>:"/\\|?*]/g, '')
+    .replace(/\s+/g, ' ')
     .trim();
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }

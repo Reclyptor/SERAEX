@@ -11,10 +11,14 @@ export interface OrganizeLibraryInput {
   sourceDir: string;
   /** If true, log intended actions without making changes */
   dryRun?: boolean;
-  /** Minimum episode duration in minutes (default: 20) */
-  minDurationMinutes?: number;
   /** Confidence threshold for auto-rename (default: 0.85) */
   confidenceThreshold?: number;
+  /** Root directory for processing work (default: /mnt/media/processing) */
+  processingRoot?: string;
+  /** Root directory for staging (default: /mnt/media/staging) */
+  stagingRoot?: string;
+  /** Root directory for final output (default: /mnt/media/output) */
+  outputRoot?: string;
 }
 
 export interface OrganizeLibraryResult {
@@ -38,8 +42,8 @@ export type FolderStatus =
   | 'extracting'
   | 'matching'
   | 'renaming'
+  | 'awaiting_detection_review'
   | 'awaiting_review'
-  | 'moving'
   | 'completed'
   | 'failed';
 
@@ -58,12 +62,12 @@ export interface ProcessFolderInput {
   folderPath: string;
   /** Name of the folder (disc directory name, for display) */
   folderName: string;
+  /** Absolute path to the series root in processing (parent of disc dirs) */
+  seriesRootDir: string;
   /** Full series metadata with all seasons and episodes */
   seriesMetadata: SeriesMetadata;
   /** If true, log intended actions without making changes */
   dryRun?: boolean;
-  /** Minimum episode duration in minutes */
-  minDurationMinutes: number;
   /** Confidence threshold for auto-rename */
   confidenceThreshold: number;
 }
@@ -75,6 +79,8 @@ export interface ProcessFolderResult {
   episodesRenamed: number;
   episodesPendingReview: number;
   renamedFiles: RenamedFile[];
+  /** Original absolute paths of files that were identified as episodes */
+  episodeOriginalPaths: string[];
   /** Video files that were not matched to any episode */
   unprocessedFiles: string[];
   error?: string;
@@ -84,15 +90,30 @@ export interface ProcessFolderResult {
 // Activity Types
 // ============================================
 
-export interface MediaFile {
-  /** Absolute path to the file */
+/** Information about a file discovered during enumeration */
+export interface SourceFileInfo {
+  /** Absolute path */
   path: string;
-  /** File name (without directory) */
-  fileName: string;
-  /** File extension (e.g., '.mkv') */
-  extension: string;
-  /** Duration in seconds */
-  durationSeconds: number;
+  /** Path relative to the enumeration root */
+  relativePath: string;
+  /** File name (basename) */
+  name: string;
+  /** File size in bytes */
+  size: number;
+}
+
+/** Result of file-size-clustering episode detection */
+export interface EpisodeDetectionResult {
+  /** Files identified as likely episodes */
+  episodes: SourceFileInfo[];
+  /** Files identified as non-episodes (extras, bonus content, etc.) */
+  nonEpisodes: SourceFileInfo[];
+  /** How confident the detection is */
+  confidence: 'high' | 'medium' | 'low';
+  /** Median file size of the episode cluster in bytes */
+  clusterMedianSize: number;
+  /** [min, max] file size range of the episode cluster in bytes */
+  clusterSizeRange: [number, number];
 }
 
 export interface SubtitleTrack {
@@ -168,6 +189,14 @@ export interface SeasonInfo {
   episodes: AnimeEpisode[];
 }
 
+/** Minimal season entry returned by the discoverAllSeasons activity */
+export interface MinimalAnimeEntry {
+  anilistId: number;
+  title: { romaji: string; english: string | null };
+  episodeCount: number;
+  format: string;
+}
+
 export interface SeriesMetadata {
   /** Canonical series name (from the first season's English or romaji title) */
   seriesName: string;
@@ -201,9 +230,11 @@ export interface MatchResult {
 export interface RenamedFile {
   /** Original file path */
   originalPath: string;
-  /** New file path */
+  /** Original path relative to the series root (for extras hierarchy) */
+  originalRelativePath: string;
+  /** New file path (in _episodes/ working dir) */
   newPath: string;
-  /** New file name */
+  /** New file name (Plex format) */
   newFileName: string;
   /** Season number */
   seasonNumber: number;
@@ -252,8 +283,21 @@ export interface ReviewDecision {
 }
 
 /**
+ * Signal for user to confirm or correct the detected episode list.
+ * Sent when detection confidence is low or medium.
+ */
+export interface DetectionConfirmation {
+  /** Whether the user accepts the detected episode list */
+  confirmed: boolean;
+  /** File paths the user wants to add to the episode list */
+  addedPaths?: string[];
+  /** File paths the user wants to remove from the episode list */
+  removedPaths?: string[];
+}
+
+/**
  * Finalize signal payload.
- * Sent by the user after all reviews are resolved to approve the final output.
+ * Sent by the user to approve or reject the staged output.
  */
 export interface FinalizeDecision {
   /** Whether to proceed with publishing to output */
@@ -266,11 +310,8 @@ export interface FinalizeDecision {
 
 export type WorkflowStage =
   | 'copying'
-  | 'detecting'
-  | 'extracting'
-  | 'matching'
-  | 'awaiting_review'
-  | 'renaming'
+  | 'fetching_metadata'
+  | 'processing_folders'
   | 'structuring'
   | 'awaiting_finalize'
   | 'finalizing'
@@ -278,17 +319,70 @@ export type WorkflowStage =
   | 'failed'
   | 'canceled';
 
+/** Progress for the file copy stage (copying to processing or staging) */
+export interface CopyProgress {
+  totalFiles: number;
+  filesCopied: number;
+  totalBytes: number;
+  bytesCopied: number;
+  /** Files currently being copied (up to 4 in parallel) */
+  currentFiles: string[];
+  /** Sizes of files currently being copied */
+  currentFileSizes: number[];
+}
+
+/** Progress for the metadata fetching stage */
+export interface MetadataSummary {
+  status: 'searching' | 'found' | 'traversing' | 'fetching_episodes' | 'complete';
+  seriesName?: string;
+  seasonCount?: number;
+  seasons?: Array<{ seasonNumber: number; title: string; episodeCount: number }>;
+  totalEpisodes?: number;
+}
+
+/** Progress for the structuring stage (building Plex layout + copying to staging) */
+export interface StructuringProgress {
+  totalFiles: number;
+  filesStructured: number;
+  currentFile?: string;
+}
+
+/** Progress for the output copy stage (staging to output) */
+export interface OutputProgress {
+  totalFiles: number;
+  filesCopied: number;
+  /** Files currently being copied (up to 4 in parallel) */
+  currentFiles: string[];
+}
+
 export interface OrganizeLibraryProgress {
+  workflowStage: WorkflowStage;
+
+  // ── Stage-specific sub-objects (populated when relevant) ──
+
+  /** Stage 1: copying files to processing */
+  copyProgress?: CopyProgress;
+  /** Stage 2: fetching metadata from AniList */
+  metadataSummary?: MetadataSummary;
+  /** Stage 4: structuring in processing + copying to staging */
+  structuringProgress?: StructuringProgress;
+  /** Stage 6: copying from staging to output */
+  outputProgress?: OutputProgress;
+
+  // ── Folder processing (stage 3) ──
+
   totalFolders: number;
   foldersCompleted: number;
   foldersFailed: number;
   foldersInProgress: number;
   foldersPendingReview: number;
   folderStatuses: Record<string, FolderStatus>;
-  workflowStage: WorkflowStage;
   expectedCoreEpisodeCount: number;
   resolvedCoreEpisodeCount: number;
   unresolvedCoreEpisodeCount: number;
+
+  // ── Approval ──
+
   canFinalize: boolean;
   awaitingFinalApproval: boolean;
 }
@@ -296,8 +390,26 @@ export interface OrganizeLibraryProgress {
 export interface ProcessFolderProgress {
   folderName: string;
   status: FolderStatus;
-  totalFiles: number;
-  filesProcessed: number;
+
+  // ── Episode detection ──
+  totalVideoFiles?: number;
+  detectedEpisodeCount?: number;
+  detectionConfidence?: 'high' | 'medium' | 'low';
+
+  // ── Subtitle extraction ──
+  totalEpisodeFiles?: number;
+  subtitlesExtracted?: number;
+  currentFile?: string;
+
+  // ── LLM matching ──
+  matchesFound?: number;
+  totalToMatch?: number;
+
+  // ── Copy-rename ──
+  episodesCopied?: number;
+  totalEpisodesToCopy?: number;
+
+  // ── HIL reviews ──
   pendingReviews: ReviewItem[];
 }
 
